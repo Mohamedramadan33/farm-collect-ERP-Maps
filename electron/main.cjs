@@ -83,15 +83,47 @@ async function waitForServerReady(url, timeoutMs = 25000) {
   throw new Error(`Timed out waiting for service at ${url}`);
 }
 
-function getBackendLaunchSpec(port) {
+function getPortableDirs() {
   const userDataDir = app.getPath('userData');
   const resourcesPath = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..');
+  const executableDir =
+    process.env.PORTABLE_EXECUTABLE_DIR ||
+    (app.isPackaged ? path.dirname(process.execPath) : path.resolve(__dirname, '..'));
+  return { userDataDir, resourcesPath, executableDir };
+}
+
+function loadPortableEnv() {
+  try {
+    const dotenv = require('dotenv');
+    const { executableDir, userDataDir, resourcesPath } = getPortableDirs();
+    const candidates = [
+      path.join(executableDir, '.env'),
+      path.join(userDataDir, '.env'),
+      path.join(resourcesPath, '.env'),
+      path.resolve(__dirname, '..', '.env'),
+    ];
+    for (const envPath of candidates) {
+      if (fs.existsSync(envPath)) {
+        dotenv.config({ path: envPath });
+      }
+    }
+  } catch {
+    // Non-fatal if dotenv cannot load in main process
+  }
+}
+
+loadPortableEnv();
+
+function getBackendLaunchSpec(port) {
+  const { userDataDir, resourcesPath, executableDir } = getPortableDirs();
   const staticDistDir = path.join(app.getAppPath(), 'dist');
 
   const baseEnv = {
     ...process.env,
     PORT: String(port),
     BIND_HOST: '127.0.0.1',
+    PORTABLE_EXECUTABLE_DIR: executableDir,
+    EXECUTABLE_DIR: executableDir,
     USER_DATA_DIR: userDataDir,
     RESOURCES_PATH: resourcesPath,
     STATIC_DIST_DIR: staticDistDir,

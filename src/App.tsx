@@ -371,14 +371,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (mapsApiKey) return;
     fetch('/api/maps-config')
       .then((res) => res.json())
       .then((data: { apiKey?: string }) => {
         if (data?.apiKey) setMapsApiKey(data.apiKey);
       })
       .catch(() => {});
-  }, [mapsApiKey]);
+  }, []);
 
   const authHeaders = useCallback(
     (extra?: Record<string, string>): Record<string, string> => {

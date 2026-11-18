@@ -7,9 +7,14 @@ import type { Request, Response } from 'express';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR || '';
 const RESOURCES_PATH = process.env.RESOURCES_PATH || process.cwd();
+const PORTABLE_DIR =
+  process.env.PORTABLE_EXECUTABLE_DIR ||
+  process.env.EXECUTABLE_DIR ||
+  (process.env.ELECTRON_RUN_AS_NODE === '1' ? path.dirname(process.execPath) : process.cwd());
 
 const envCandidates = [
   process.env.ENV_FILE_PATH,
+  path.join(PORTABLE_DIR, '.env'),
   USER_DATA_DIR ? path.join(USER_DATA_DIR, '.env') : undefined,
   RESOURCES_PATH ? path.join(RESOURCES_PATH, '.env') : undefined,
   path.resolve(process.cwd(), '.env'),
@@ -28,6 +33,7 @@ const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
 const ERPNEXT_URL = (process.env.ERPNEXT_URL || 'https://erp-sys.sekem.com').replace(/\/+$/, '');
 
 const SEED_CACHE_CANDIDATES = [
+  path.join(PORTABLE_DIR, 'geocode_cache.json'),
   path.join(RESOURCES_PATH, 'geocode_cache.json'),
   path.resolve(process.cwd(), 'geocode_cache.json'),
 ];

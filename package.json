@@ -41,16 +41,17 @@
       {
         "from": ".env.example",
         "to": ".env.example"
+      },
+      {
+        "from": ".",
+        "to": ".",
+        "filter": [
+          ".env"
+        ]
       }
     ],
     "win": {
       "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
         {
           "target": "portable",
           "arch": [
@@ -59,17 +60,8 @@
         }
       ]
     },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Sekem Farms Mapper",
-      "artifactName": "${productName}-${version}-Setup.${ext}"
-    },
     "portable": {
-      "artifactName": "${productName}-${version}-Portable.${ext}"
+      "artifactName": "Sekem-Farms-Mapper.exe"
     }
   },
   "dependencies": {
