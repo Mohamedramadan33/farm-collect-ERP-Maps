@@ -21,6 +21,8 @@ interface MarkazEntry {
   governorate: string;
   markaz: string;
   village: string;
+  isEgypt?: boolean;
+  countryCode?: string;
 }
 
 const sessionStore = new Map<string, ErpSession>();
@@ -89,19 +91,78 @@ function clearSessionCookie(req: Request, res: Response): void {
   res.setHeader('Set-Cookie', parts.join('; '));
 }
 
+function isWithinEgyptBounds(lat: number, lon: number): boolean {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  if (lat < 21.65 || lat > 31.72 || lon < 24.65 || lon > 36.95) return false;
+  // Exclude Saudi Arabia / Jordan east of Red Sea & Gulf of Aqaba (above Halayeb/Shalateen)
+  if (lat > 24.5 && lon > 34.95) return false;
+  // Exclude northeast border beyond Rafah–Taba line
+  if (lat > 29.49 && lon > 34.94 - (lat - 29.49) * 0.38) return false;
+  return true;
+}
+
+function normalizeEgyptCoords(
+  lat: number,
+  lon: number,
+): { lat: number | null; lon: number | null; outOfEgypt: boolean; rawLat: number; rawLon: number } {
+  if (isWithinEgyptBounds(lat, lon)) {
+    return { lat, lon, outOfEgypt: false, rawLat: lat, rawLon: lon };
+  }
+  if (isWithinEgyptBounds(lon, lat)) {
+    return { lat: lon, lon: lat, outOfEgypt: false, rawLat: lat, rawLon: lon };
+  }
+  return { lat: null, lon: null, outOfEgypt: true, rawLat: lat, rawLon: lon };
+}
+
+function parseCoordNumber(val: unknown): number | null {
+  if (val === null || val === undefined || typeof val === 'boolean' || typeof val === 'object') {
+    return null;
+  }
+  const str = String(val).trim();
+  if (!str) return null;
+  const num = Number(str);
+  if (!Number.isFinite(num) || num === 0) return null;
+  return num;
+}
+
+function parseCacheKeyCoords(key: string): { lat: number; lon: number } | null {
+  const parts = key.split('_');
+  if (parts.length !== 2) return null;
+  const lat = Number(parts[0]);
+  const lon = Number(parts[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+}
+
 function readGeocodeCache(): Record<string, MarkazEntry> {
   try {
     if (!fs.existsSync(CACHE_FILE)) return {};
     const raw = fs.readFileSync(CACHE_FILE, 'utf-8').trim();
     if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, Record<string, string>>;
+    const parsed = JSON.parse(raw) as Record<string, Record<string, unknown>>;
     const normalized: Record<string, MarkazEntry> = {};
     for (const [k, v] of Object.entries(parsed)) {
       if (!v || typeof v !== 'object') continue;
+      const coords = parseCacheKeyCoords(k);
+      if (coords && !isWithinEgyptBounds(coords.lat, coords.lon)) continue;
+      const gov = String(v.governorate || v['المحافظة'] || 'غير محدد');
+      const mkz = String(v.markaz || v['المركز'] || 'غير محدد');
+      const vlg = String(v.village || v['القرية_المنطقة'] || 'غير محدد');
+      const countryCode = typeof v.countryCode === 'string' ? v.countryCode.toLowerCase() : undefined;
+      const isEgypt =
+        v.isEgypt === false ||
+        gov === 'خارج مصر' ||
+        mkz === 'خارج مصر' ||
+        (countryCode !== undefined && countryCode !== 'eg')
+          ? false
+          : true;
+      if (isEgypt && gov === 'غير محدد' && mkz === 'غير محدد') continue;
       normalized[k] = {
-        governorate: v.governorate || v['المحافظة'] || 'غير محدد',
-        markaz: v.markaz || v['المركز'] || 'غير محدد',
-        village: v.village || v['القرية_المنطقة'] || 'غير محدد',
+        governorate: gov,
+        markaz: mkz,
+        village: vlg,
+        isEgypt,
+        countryCode,
       };
     }
     return normalized;
@@ -111,12 +172,14 @@ function readGeocodeCache(): Record<string, MarkazEntry> {
 }
 
 function writeGeocodeCache(cache: Record<string, MarkazEntry>): void {
-  const serializable: Record<string, Record<string, string>> = {};
+  const serializable: Record<string, Record<string, unknown>> = {};
   for (const [k, v] of Object.entries(cache)) {
     serializable[k] = {
       المحافظة: v.governorate,
       المركز: v.markaz,
       القرية_المنطقة: v.village,
+      isEgypt: v.isEgypt !== false,
+      ...(v.countryCode ? { countryCode: v.countryCode } : {}),
     };
   }
   fs.writeFileSync(CACHE_FILE, JSON.stringify(serializable, null, 2), 'utf-8');
@@ -140,62 +203,492 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function detectLatLonFromRecord(record: Record<string, unknown>): { lat: number | null; lon: number | null } {
-  const keys = Object.keys(record);
-  const latKey =
-    keys.find((k) => /^(lat|latitude)$/i.test(k.trim())) ||
-    keys.find((k) => /latitude|\blat\b/i.test(k));
-  const lonKey =
-    keys.find((k) => /^(lng|long|lon|longitude)$/i.test(k.trim())) ||
-    keys.find((k) => /longitude|\b(lng|long|lon)\b/i.test(k));
+function coordCacheKey(lat: number, lon: number): string {
+  return `${Number(lat.toFixed(2))}_${Number(lon.toFixed(2))}`;
+}
 
-  const rawLat = latKey ? Number(record[latKey]) : NaN;
-  const rawLon = lonKey ? Number(record[lonKey]) : NaN;
+let googleQuotaBlockedUntil = 0;
 
-  let validLat = Number.isFinite(rawLat) && rawLat !== 0 && rawLat >= -90 && rawLat <= 90 ? rawLat : null;
-  let validLon = Number.isFinite(rawLon) && rawLon !== 0 && rawLon >= -180 && rawLon <= 180 ? rawLon : null;
+function hasArabicText(text: string): boolean {
+  return /[\u0600-\u06FF]/.test(text);
+}
 
-  // Fallback for Frappe Geolocation fields storing GeoJSON strings
-  if (validLat === null || validLon === null) {
-    for (const val of Object.values(record)) {
-      if (typeof val === 'string' && val.includes('"coordinates"') && val.trim().startsWith('{')) {
-        try {
-          const parsed = JSON.parse(val) as {
-            features?: { geometry?: { type?: string; coordinates?: unknown } }[];
-            geometry?: { type?: string; coordinates?: unknown };
-          };
-          const geom = parsed.features?.[0]?.geometry || parsed.geometry;
-          if (geom?.type === 'Point' && Array.isArray(geom.coordinates) && geom.coordinates.length >= 2) {
-            const lon = Number(geom.coordinates[0]);
-            const lat = Number(geom.coordinates[1]);
-            if (Number.isFinite(lat) && Number.isFinite(lon) && lat !== 0 && lon !== 0) {
-              validLat = lat;
-              validLon = lon;
-              break;
-            }
-          } else if (
-            geom?.type === 'Polygon' &&
-            Array.isArray(geom.coordinates) &&
-            Array.isArray(geom.coordinates[0]) &&
-            Array.isArray(geom.coordinates[0][0])
-          ) {
-            const ring = geom.coordinates[0] as number[][];
-            const avgLon = ring.reduce((sum, pt) => sum + Number(pt[0] || 0), 0) / ring.length;
-            const avgLat = ring.reduce((sum, pt) => sum + Number(pt[1] || 0), 0) / ring.length;
-            if (Number.isFinite(avgLat) && Number.isFinite(avgLon) && avgLat !== 0 && avgLon !== 0) {
-              validLat = avgLat;
-              validLon = avgLon;
-              break;
-            }
-          }
-        } catch {
-          // Ignore malformed JSON strings
+function normalizeArabicPlaceName(raw?: string | null): string {
+  if (!raw) return '';
+  let text = String(raw).replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  text = text
+    .replace(/\bمدينه\b/g, 'مدينة')
+    .replace(/\bمنطقه\b/g, 'منطقة')
+    .replace(/\bقريه\b/g, 'قرية')
+    .replace(/\bمحافظه\b/g, 'محافظة')
+    .replace(/\bعزبه\b/g, 'عزبة')
+    .replace(/\bناحيه\b/g, 'ناحية')
+    .replace(/الكتيبه$/g, 'الكتيبة')
+    .replace(/البحريه$/g, 'البحرية')
+    .replace(/الفرافره$/g, 'الفرافرة')
+    .replace(/الخارجه$/g, 'الخارجة')
+    .replace(/الداخله$/g, 'الداخلة')
+    .replace(/سيوه$/g, 'سيوة')
+    .replace(/الاسماعيليه$/g, 'الإسماعيلية');
+  return text;
+}
+
+function normalizeEgyptGovernorateName(raw?: string | null): string {
+  const cleaned = normalizeArabicPlaceName(raw).replace(/^محافظة\s+/, '').trim();
+  if (!cleaned) return 'غير محدد';
+
+  const compact = cleaned
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة$/g, 'ه');
+
+  const map: Record<string, string> = {
+    'القاهره': 'القاهرة',
+    'الجيزه': 'الجيزة',
+    'الاسكندريه': 'الإسكندرية',
+    'القليوبيه': 'القليوبية',
+    'الشرقيه': 'الشرقية',
+    'الدقهليه': 'الدقهلية',
+    'البحيره': 'البحيرة',
+    'الغربيه': 'الغربية',
+    'المنوفيه': 'المنوفية',
+    'كفر الشيخ': 'كفر الشيخ',
+    'دمياط': 'دمياط',
+    'بورسعيد': 'بورسعيد',
+    'الاسماعيليه': 'الإسماعيلية',
+    'السويس': 'السويس',
+    'شمال سيناء': 'شمال سيناء',
+    'جنوب سيناء': 'جنوب سيناء',
+    'مطروح': 'مطروح',
+    'الفيوم': 'الفيوم',
+    'بني سويف': 'بني سويف',
+    'المنيا': 'المنيا',
+    'المنيه': 'المنيا',
+    'اسيوط': 'أسيوط',
+    'سوهاج': 'سوهاج',
+    'قنا': 'قنا',
+    'الاقصر': 'الأقصر',
+    'اسوان': 'أسوان',
+    'البحر الاحمر': 'البحر الأحمر',
+    'الوادي الجديد': 'الوادي الجديد',
+  };
+
+  return map[compact] || cleaned;
+}
+
+interface GoogleGeocodeAddressComponent {
+  long_name?: string;
+  short_name?: string;
+  types?: string[];
+}
+
+interface GoogleGeocodeResult {
+  types?: string[];
+  address_components?: GoogleGeocodeAddressComponent[];
+}
+
+function cleanGoogleAdminName(raw?: string): string {
+  if (!raw) return '';
+  const cleaned = raw.replace(/^[،,\s]+|[،,\s]+$/g, '').trim();
+  if (!cleaned) return '';
+  // Reject postal codes / pure numbers and Google Plus Codes (e.g. "5P69+4W4")
+  if (/^[\d\s،,.-]+$/.test(cleaned)) return '';
+  if (/[A-Z0-9]{2,}\+[A-Z0-9]{2,}/i.test(cleaned)) return '';
+  return cleaned;
+}
+
+async function reverseGeocodeGoogle(
+  lat: number,
+  lon: number,
+  apiKey: string,
+): Promise<{ entry?: MarkazEntry; incomplete?: boolean; quotaBlocked?: boolean }> {
+  try {
+    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+    url.searchParams.set('latlng', `${lat},${lon}`);
+    url.searchParams.set('language', 'ar');
+    url.searchParams.set('key', apiKey);
+
+    const resp = await fetch(url.toString());
+    if (!resp.ok) {
+      return { incomplete: true, quotaBlocked: resp.status === 403 || resp.status === 429 };
+    }
+
+    const json = (await resp.json()) as {
+      status?: string;
+      results?: GoogleGeocodeResult[];
+    };
+
+    if (json.status === 'OVER_QUERY_LIMIT' || json.status === 'REQUEST_DENIED') {
+      return { incomplete: true, quotaBlocked: true };
+    }
+
+    if (json.status !== 'OK' || !Array.isArray(json.results) || json.results.length === 0) {
+      return { incomplete: true };
+    }
+
+    // Prefer street/political results over raw plus_code results (which occasionally embed postal codes)
+    const orderedResults = [
+      ...json.results.filter((r) => !(r.types || []).includes('plus_code')),
+      ...json.results.filter((r) => (r.types || []).includes('plus_code')),
+    ];
+
+    let countryShort = '';
+    let gov = '';
+    let a2 = '';
+    let a3 = '';
+    let locality = '';
+    let sublocality = '';
+
+    for (const res of orderedResults) {
+      for (const comp of res.address_components || []) {
+        const types = comp.types || [];
+        if (!countryShort && types.includes('country')) {
+          countryShort = (comp.short_name || '').toUpperCase();
         }
+        const val = cleanGoogleAdminName(comp.long_name);
+        if (!val) continue;
+
+        if (!gov && types.includes('administrative_area_level_1')) {
+          gov = val;
+        }
+        if (!a2 && types.includes('administrative_area_level_2')) {
+          a2 = val;
+        }
+        if (!a3 && types.includes('administrative_area_level_3')) {
+          a3 = val;
+        }
+        if (!locality && types.includes('locality')) {
+          locality = val;
+        }
+        if (
+          !sublocality &&
+          (types.includes('sublocality_level_1') || types.includes('sublocality'))
+        ) {
+          sublocality = val;
+        }
+      }
+    }
+
+    if (countryShort && countryShort !== 'EG') {
+      return {
+        entry: {
+          governorate: 'خارج مصر',
+          markaz: 'خارج مصر',
+          village: 'خارج مصر',
+          isEgypt: false,
+          countryCode: countryShort.toLowerCase(),
+        },
+      };
+    }
+
+    if (!gov && !a2 && !locality) {
+      return { incomplete: true };
+    }
+
+    const normalizedGov = gov || 'غير محدد';
+    const mkz = a2 || locality || a3 || normalizedGov;
+    const vlg = a3 || sublocality || locality || mkz;
+
+    return {
+      entry: {
+        governorate: normalizedGov,
+        markaz: mkz,
+        village: vlg,
+        isEgypt: true,
+        countryCode: 'eg',
+      },
+    };
+  } catch {
+    return { incomplete: true };
+  }
+}
+
+async function fetchArcGisAddress(
+  lat: number,
+  lon: number,
+  featureTypes?: string,
+): Promise<Record<string, string> | null> {
+  try {
+    const url = new URL(
+      'https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode',
+    );
+    url.searchParams.set('location', `${lon},${lat}`);
+    url.searchParams.set('f', 'json');
+    url.searchParams.set('langCode', 'ar');
+    if (featureTypes) {
+      url.searchParams.set('featureTypes', featureTypes);
+    }
+
+    const resp = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
+
+    const json = (await resp.json()) as {
+      error?: unknown;
+      address?: Record<string, string>;
+    };
+    if (json.error || !json.address) return null;
+    return json.address;
+  } catch {
+    return null;
+  }
+}
+
+async function reverseGeocodeArcGis(lat: number, lon: number): Promise<MarkazEntry | null> {
+  const locAddr = await fetchArcGisAddress(lat, lon, 'Locality');
+  const needsDefault =
+    !locAddr ||
+    !locAddr.Region ||
+    !locAddr.City ||
+    !hasArabicText(locAddr.Region) ||
+    !hasArabicText(locAddr.City);
+
+  const defAddr = needsDefault ? await fetchArcGisAddress(lat, lon) : null;
+  const primary = locAddr || defAddr;
+  if (!primary) return null;
+
+  const countryCode = (locAddr?.CountryCode || defAddr?.CountryCode || '').toUpperCase();
+  if (countryCode && countryCode !== 'EGY') {
+    return {
+      governorate: 'خارج مصر',
+      markaz: 'خارج مصر',
+      village: 'خارج مصر',
+      isEgypt: false,
+      countryCode: countryCode.toLowerCase(),
+    };
+  }
+
+  const pickArabic = (...vals: (string | undefined)[]): string => {
+    for (const v of vals) {
+      if (v && v.trim() && hasArabicText(v)) return v.trim();
+    }
+    for (const v of vals) {
+      if (v && v.trim()) return v.trim();
+    }
+    return '';
+  };
+
+  const rawRegion = pickArabic(locAddr?.Region, defAddr?.Region, locAddr?.Subregion, defAddr?.Subregion);
+  const rawCity = pickArabic(locAddr?.City, defAddr?.City, locAddr?.District, defAddr?.District);
+  const rawVillage = pickArabic(
+    locAddr?.District,
+    locAddr?.Neighborhood,
+    defAddr?.District,
+    defAddr?.Neighborhood,
+    locAddr?.PlaceName,
+    rawCity,
+  );
+
+  if (!rawRegion && !rawCity) {
+    return null;
+  }
+
+  const gov = normalizeEgyptGovernorateName(rawRegion);
+  const mkz = normalizeArabicPlaceName(rawCity) || gov;
+  const vlg = normalizeArabicPlaceName(rawVillage) || mkz;
+
+  return {
+    governorate: gov,
+    markaz: mkz,
+    village: vlg,
+    isEgypt: true,
+    countryCode: 'eg',
+  };
+}
+
+async function reverseGeocodeNominatim(lat: number, lon: number): Promise<MarkazEntry | null> {
+  try {
+    const url = new URL('https://nominatim.openstreetmap.org/reverse');
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('lat', String(lat));
+    url.searchParams.set('lon', String(lon));
+    url.searchParams.set('accept-language', 'ar');
+    url.searchParams.set('addressdetails', '1');
+
+    const geoResp = await fetch(url.toString(), {
+      headers: { 'User-Agent': 'sekem_farm_mapper/1.0 (https://erp-sys.sekem.com)' },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!geoResp.ok) return null;
+
+    const geoJson = (await geoResp.json()) as {
+      error?: string;
+      address?: Record<string, string>;
+    };
+    const addr = geoJson.address || {};
+    const countryCode = (addr.country_code || '').toLowerCase();
+
+    if (geoJson.error || countryCode !== 'eg') {
+      return {
+        governorate: 'خارج مصر',
+        markaz: 'خارج مصر',
+        village: 'خارج مصر',
+        isEgypt: false,
+        countryCode: countryCode || 'sea',
+      };
+    }
+
+    const gov = normalizeEgyptGovernorateName(addr.state || addr.governorate || addr.region || 'غير محدد');
+    const mkz =
+      normalizeArabicPlaceName(
+        addr.county ||
+          addr.city_district ||
+          addr.town ||
+          addr.city ||
+          addr.municipality ||
+          addr.state_district ||
+          addr.suburb ||
+          addr.village,
+      ) || gov;
+    const vlg =
+      normalizeArabicPlaceName(
+        addr.village || addr.suburb || addr.hamlet || addr.neighbourhood || addr.quarter,
+      ) || mkz;
+
+    return {
+      governorate: gov,
+      markaz: mkz,
+      village: vlg,
+      isEgypt: true,
+      countryCode: 'eg',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectLatLonFromRecord(record: Record<string, unknown>): {
+  lat: number | null;
+  lon: number | null;
+  outOfEgypt: boolean;
+  rawLat: number | null;
+  rawLon: number | null;
+} {
+  const keys = Object.keys(record);
+  const latKeys = [
+    ...keys.filter((k) => /^(lat|latitude)$/i.test(k.trim())),
+    ...keys.filter(
+      (k) =>
+        !/^(lat|latitude)$/i.test(k.trim()) &&
+        /(^|[_.\-\s])(lat|latitude)($|[_.\-\s])/i.test(k.trim()),
+    ),
+  ];
+  const lonKeys = [
+    ...keys.filter((k) => /^(lng|long|lon|longitude)$/i.test(k.trim())),
+    ...keys.filter(
+      (k) =>
+        !/^(lng|long|lon|longitude)$/i.test(k.trim()) &&
+        (/(^|[_.\-\s])(lng|lon|longitude)($|[_.\-\s])/i.test(k.trim()) ||
+          /(gps|geo|coord|map|farm|site|loc|point|pos)[_.\-\s]*long$/i.test(k.trim())),
+    ),
+  ];
+
+  let firstOutOfEgypt: { rawLat: number; rawLon: number } | null = null;
+
+  // 1. Check all explicit lat/lon field pairs, preferring valid Egypt coordinates
+  for (const lKey of latKeys) {
+    const pLat = parseCoordNumber(record[lKey]);
+    if (pLat === null || pLat < -90 || pLat > 90) continue;
+    for (const nKey of lonKeys) {
+      const pLon = parseCoordNumber(record[nKey]);
+      if (pLon === null || pLon < -180 || pLon > 180) continue;
+      const norm = normalizeEgyptCoords(pLat, pLon);
+      if (!norm.outOfEgypt && norm.lat !== null && norm.lon !== null) {
+        return { lat: norm.lat, lon: norm.lon, outOfEgypt: false, rawLat: norm.rawLat, rawLon: norm.rawLon };
+      }
+      if (!firstOutOfEgypt) {
+        firstOutOfEgypt = { rawLat: pLat, rawLon: pLon };
       }
     }
   }
 
-  return { lat: validLat, lon: validLon };
+  // 2. Check combined "lat, lon" coordinate strings
+  for (const [k, val] of Object.entries(record)) {
+    if (typeof val !== 'string') continue;
+    if (/date|time|creation|modified/i.test(k)) continue;
+    const trimmed = val.trim();
+    const pairMatch = trimmed.match(/^(-?\d{1,2}\.\d{2,})\s*[,;\s]\s*(-?\d{1,3}\.\d{2,})$/);
+    if (!pairMatch) continue;
+    const pLat = Number(pairMatch[1]);
+    const pLon = Number(pairMatch[2]);
+    if (!Number.isFinite(pLat) || !Number.isFinite(pLon) || pLat === 0 || pLon === 0) continue;
+    if (pLat < -90 || pLat > 90 || pLon < -180 || pLon > 180) continue;
+
+    const keyHintsGeo = /lat|lon|lng|coord|gps|geo|loc|map|point|pos/i.test(k);
+    const norm = normalizeEgyptCoords(pLat, pLon);
+    if (!norm.outOfEgypt && norm.lat !== null && norm.lon !== null) {
+      return { lat: norm.lat, lon: norm.lon, outOfEgypt: false, rawLat: norm.rawLat, rawLon: norm.rawLon };
+    }
+    if (keyHintsGeo && !firstOutOfEgypt) {
+      firstOutOfEgypt = { rawLat: pLat, rawLon: pLon };
+    }
+  }
+
+  // 3. Check Frappe Geolocation fields storing GeoJSON strings
+  for (const val of Object.values(record)) {
+    if (typeof val !== 'string' || !val.includes('"coordinates"') || !val.trim().startsWith('{')) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(val) as {
+        features?: { geometry?: { type?: string; coordinates?: unknown } }[];
+        geometry?: { type?: string; coordinates?: unknown };
+      };
+      const geom = parsed.features?.[0]?.geometry || parsed.geometry;
+      let gLat: number | null = null;
+      let gLon: number | null = null;
+
+      if (geom?.type === 'Point' && Array.isArray(geom.coordinates) && geom.coordinates.length >= 2) {
+        gLon = Number(geom.coordinates[0]);
+        gLat = Number(geom.coordinates[1]);
+      } else if (
+        geom?.type === 'Polygon' &&
+        Array.isArray(geom.coordinates) &&
+        Array.isArray(geom.coordinates[0]) &&
+        Array.isArray(geom.coordinates[0][0])
+      ) {
+        const ring = geom.coordinates[0] as number[][];
+        gLon = ring.reduce((sum, pt) => sum + Number(pt[0] || 0), 0) / ring.length;
+        gLat = ring.reduce((sum, pt) => sum + Number(pt[1] || 0), 0) / ring.length;
+      } else if (
+        geom?.type === 'MultiPolygon' &&
+        Array.isArray(geom.coordinates) &&
+        Array.isArray(geom.coordinates[0]) &&
+        Array.isArray(geom.coordinates[0][0]) &&
+        Array.isArray(geom.coordinates[0][0][0])
+      ) {
+        const ring = geom.coordinates[0][0] as number[][];
+        gLon = ring.reduce((sum, pt) => sum + Number(pt[0] || 0), 0) / ring.length;
+        gLat = ring.reduce((sum, pt) => sum + Number(pt[1] || 0), 0) / ring.length;
+      }
+
+      if (gLat !== null && gLon !== null && Number.isFinite(gLat) && Number.isFinite(gLon) && gLat !== 0 && gLon !== 0) {
+        const norm = normalizeEgyptCoords(gLat, gLon);
+        if (!norm.outOfEgypt && norm.lat !== null && norm.lon !== null) {
+          return { lat: norm.lat, lon: norm.lon, outOfEgypt: false, rawLat: norm.rawLat, rawLon: norm.rawLon };
+        }
+        if (!firstOutOfEgypt) {
+          firstOutOfEgypt = { rawLat: gLat, rawLon: gLon };
+        }
+      }
+    } catch {
+      // Ignore malformed JSON strings
+    }
+  }
+
+  if (firstOutOfEgypt) {
+    return {
+      lat: null,
+      lon: null,
+      outOfEgypt: true,
+      rawLat: firstOutOfEgypt.rawLat,
+      rawLon: firstOutOfEgypt.rawLon,
+    };
+  }
+
+  return { lat: null, lon: null, outOfEgypt: false, rawLat: null, rawLon: null };
 }
 
 async function startServer(): Promise<void> {
@@ -367,6 +860,26 @@ async function startServer(): Promise<void> {
     const headers = buildErpHeaders(found?.session ?? null);
 
     try {
+      // Optionally inspect Farm DocType metadata so we match custom title/area fields & Arabic/English labels
+      let docTitleField = '';
+      const fieldLabels: Record<string, string> = {};
+      const metaAreaFields: string[] = [];
+
+      const docMetaPromise = fetch(
+        `${ERPNEXT_URL}/api/method/frappe.desk.form.load.getdoctype?doctype=Farm`,
+        { headers },
+      )
+        .then(async (r) => {
+          if (!r.ok) return null;
+          return (await r.json()) as {
+            docs?: {
+              title_field?: string;
+              fields?: { fieldname?: string; label?: string; fieldtype?: string }[];
+            }[];
+          };
+        })
+        .catch(() => null);
+
       const pageSize = 500;
       const rawRows: Record<string, unknown>[] = [];
       const seenNames = new Set<string>();
@@ -431,25 +944,151 @@ async function startServer(): Promise<void> {
         limitStart += pageSize;
       }
 
+      const metaJson = await docMetaPromise;
+      const farmMeta = metaJson?.docs?.find((d) => Array.isArray(d.fields)) || metaJson?.docs?.[0];
+      if (farmMeta) {
+        if (farmMeta.title_field) {
+          docTitleField = farmMeta.title_field;
+        }
+        for (const f of farmMeta.fields || []) {
+          if (!f.fieldname) continue;
+          if (f.label) {
+            fieldLabels[f.fieldname] = f.label;
+          }
+          const isNumericType = f.fieldtype === 'Float' || f.fieldtype === 'Int' || f.fieldtype === 'Currency';
+          const textToCheck = `${f.fieldname} ${f.label || ''}`;
+          if (
+            isNumericType &&
+            /(area|feddan|acre|hectar|size|مساح|فدان|هكتار)/i.test(textToCheck) &&
+            !/(price|cost|rate|year|date|count|code)/i.test(f.fieldname)
+          ) {
+            metaAreaFields.push(f.fieldname);
+          }
+        }
+      }
+
       const cache = readGeocodeCache();
+      let detectedNameField: string | null = null;
+      let detectedAreaField: string | null = null;
+
+      const nameCandidateKeys = [
+        ...(docTitleField ? [docTitleField] : []),
+        'farm_name',
+        'farm_name_ar',
+        'arabic_name',
+        'name_ar',
+        'custom_farm_name',
+        'custom_name',
+        'farm_title',
+        'title',
+        'farm',
+        'farmer_name',
+        'display_name',
+      ];
+
+      const areaCandidateKeys = [
+        ...metaAreaFields,
+        'area',
+        'total_area',
+        'farm_area',
+        'total_farm_area',
+        'cultivated_area',
+        'land_area',
+        'area_in_feddans',
+        'area_feddan',
+        'total_feddans',
+        'feddan',
+        'feddans',
+        'custom_area',
+        'custom_total_area',
+        'custom_farm_area',
+        'custom_feddan',
+        'farm_size',
+        'size',
+        'acres',
+        'hectares',
+      ];
 
       const farms = rawRows.map((row) => {
-        const { lat, lon } = detectLatLonFromRecord(row);
-        const cacheKey = lat !== null && lon !== null ? `${Number(lat.toFixed(3))}_${Number(lon.toFixed(3))}` : null;
-        const cachedGeo = cacheKey ? cache[cacheKey] : undefined;
+        const detected = detectLatLonFromRecord(row);
+        const cacheKey =
+          detected.lat !== null && detected.lon !== null
+            ? coordCacheKey(detected.lat, detected.lon)
+            : null;
+        const legacyKey =
+          detected.lat !== null && detected.lon !== null
+            ? `${Number(detected.lat.toFixed(3))}_${Number(detected.lon.toFixed(3))}`
+            : null;
+        const cachedGeo =
+          (cacheKey ? cache[cacheKey] : undefined) || (legacyKey ? cache[legacyKey] : undefined);
+        const cachedOutOfEgypt = cachedGeo?.governorate === 'خارج مصر' || cachedGeo?.markaz === 'خارج مصر';
 
-        const nameVal =
-          row.farm_name ||
-          row.title ||
-          row.farm ||
-          row.name ||
-          'Unnamed Farm';
+        const effectiveOutOfEgypt = detected.outOfEgypt || cachedOutOfEgypt;
+        const effectiveLat = effectiveOutOfEgypt ? null : detected.lat;
+        const effectiveLon = effectiveOutOfEgypt ? null : detected.lon;
+
+        // Detect best human-readable Farm Name
+        let nameVal: unknown = null;
+        for (const k of nameCandidateKeys) {
+          const candidate = row[k];
+          if (typeof candidate === 'string' && candidate.trim() !== '') {
+            nameVal = candidate.trim();
+            if (!detectedNameField) detectedNameField = k;
+            break;
+          }
+        }
+        if (nameVal === null) {
+          const dynamicNameKey = Object.keys(row).find(
+            (k) =>
+              /(farm_?name|arabic_?name|title)/i.test(k) &&
+              typeof row[k] === 'string' &&
+              String(row[k]).trim() !== '',
+          );
+          if (dynamicNameKey) {
+            nameVal = String(row[dynamicNameKey]).trim();
+            if (!detectedNameField) detectedNameField = dynamicNameKey;
+          } else {
+            nameVal = row.name || 'Unnamed Farm';
+            if (!detectedNameField && row.name) detectedNameField = 'name';
+          }
+        }
+
+        // Detect best numeric Farm Area
+        let areaVal: number | null = null;
+        for (const k of areaCandidateKeys) {
+          const rawCandidate = row[k];
+          if (rawCandidate !== null && rawCandidate !== undefined && rawCandidate !== '' && typeof rawCandidate !== 'boolean') {
+            const num = Number(rawCandidate);
+            if (Number.isFinite(num)) {
+              areaVal = num;
+              if (!detectedAreaField) detectedAreaField = k;
+              break;
+            }
+          }
+        }
+        if (areaVal === null) {
+          const dynamicAreaKey = Object.keys(row).find((k) => {
+            if (!/(area|feddan|acre|hectar|size|مساح|فدان)/i.test(k)) return false;
+            if (/(name|id|code|manager|owner|type|status|unit|uom|year|date|price|cost|qty)/i.test(k)) return false;
+            const v = row[k];
+            return v !== null && v !== undefined && v !== '' && typeof v !== 'boolean' && Number.isFinite(Number(v));
+          });
+          if (dynamicAreaKey) {
+            areaVal = Number(row[dynamicAreaKey]);
+            if (!detectedAreaField) detectedAreaField = dynamicAreaKey;
+          }
+        }
+
+        const areaUnitRaw = row.area_uom || row.area_unit || row.uom || row.unit || null;
+        const areaUnit = typeof areaUnitRaw === 'string' && areaUnitRaw.trim() ? areaUnitRaw.trim() : null;
+
+        const codeRaw = row.farm_code || row.farm_id || row.code || null;
+        const code =
+          typeof codeRaw === 'string' || typeof codeRaw === 'number'
+            ? String(codeRaw).trim() || null
+            : null;
 
         const statusVal = row.farm_status || row.status || row.workflow_state || 'Active';
-        const areaRaw = row.area ?? row.total_area ?? row.farm_area ?? row.area_in_feddans ?? null;
-        const areaVal = areaRaw !== null && areaRaw !== undefined && Number.isFinite(Number(areaRaw))
-          ? Number(areaRaw)
-          : null;
 
         const rawScalars: Record<string, string | number | boolean | null> = {};
         for (const [k, v] of Object.entries(row)) {
@@ -458,19 +1097,34 @@ async function startServer(): Promise<void> {
           }
         }
 
+        const erpGov = row.governorate || row.custom_governorate || null;
+        const erpMarkaz = row.markaz || row.custom_markaz || null;
+        const erpVillage = row.village || row.custom_village || null;
+
         return {
           id: String(row.name || ''),
+          code: code && code !== String(row.name || '') ? code : null,
           name: String(nameVal),
           type: String(row.type || row.farm_type || ''),
           status: String(statusVal),
           creation: String(row.creation || '').slice(0, 10),
           area: areaVal,
-          lat,
-          lon,
+          areaUnit,
+          lat: effectiveLat,
+          lon: effectiveLon,
+          outOfEgypt: effectiveOutOfEgypt,
+          rawLat: detected.rawLat,
+          rawLon: detected.rawLon,
           cacheKey,
-          governorate: cachedGeo?.governorate ?? null,
-          markaz: cachedGeo?.markaz ?? null,
-          village: cachedGeo?.village ?? null,
+          governorate: effectiveOutOfEgypt
+            ? null
+            : cachedGeo?.governorate ?? (effectiveLat === null && erpGov ? String(erpGov) : null),
+          markaz: effectiveOutOfEgypt
+            ? null
+            : cachedGeo?.markaz ?? (effectiveLat === null && erpMarkaz ? String(erpMarkaz) : null),
+          village: effectiveOutOfEgypt
+            ? null
+            : cachedGeo?.village ?? (effectiveLat === null && erpVillage ? String(erpVillage) : null),
           raw: rawScalars,
         };
       });
@@ -479,6 +1133,12 @@ async function startServer(): Promise<void> {
         farms,
         total: farms.length,
         withCoordinates: farms.filter((f) => f.lat !== null && f.lon !== null).length,
+        outOfEgyptCount: farms.filter((f) => f.outOfEgypt).length,
+        schemaInfo: {
+          nameField: detectedNameField,
+          areaField: detectedAreaField,
+          fieldLabels,
+        },
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Failed to fetch farms from ERPNext.';
@@ -536,60 +1196,116 @@ async function startServer(): Promise<void> {
     const resolved: Record<string, MarkazEntry> = {};
     let newLookups = 0;
 
-    // Cap per request to keep UI responsive while persisting incremental progress
+    // Quantize to ~1.1 km spatial cells so nearby farms share one lookup immediately
     const uniquePairs = new Map<string, { lat: number; lon: number }>();
     for (const item of coordinates) {
       if (
         typeof item?.lat === 'number' &&
         typeof item?.lon === 'number' &&
-        Number.isFinite(item.lat) &&
-        Number.isFinite(item.lon) &&
-        item.lat !== 0 &&
-        item.lon !== 0
+        isWithinEgyptBounds(item.lat, item.lon)
       ) {
-        const key = `${Number(item.lat.toFixed(3))}_${Number(item.lon.toFixed(3))}`;
+        const key = coordCacheKey(item.lat, item.lon);
+        const legacyKey = `${Number(item.lat.toFixed(3))}_${Number(item.lon.toFixed(3))}`;
         if (cache[key]) {
           resolved[key] = cache[key];
+        } else if (cache[legacyKey]) {
+          cache[key] = cache[legacyKey];
+          resolved[key] = cache[legacyKey];
         } else if (!uniquePairs.has(key)) {
           uniquePairs.set(key, { lat: item.lat, lon: item.lon });
         }
       }
     }
 
-    const maxBatch = 35;
-    let processed = 0;
-    for (const [key, pair] of uniquePairs.entries()) {
-      if (processed >= maxBatch) break;
-      if (processed > 0) {
-        await delay(1100);
-      }
-      processed += 1;
+    const googleApiKey =
+      process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || '';
+    const useGoogle = Boolean(googleApiKey) && Date.now() > googleQuotaBlockedUntil;
+    const maxBatch = 150;
+    const entriesToProcess = Array.from(uniquePairs.entries()).slice(0, maxBatch);
+    const processed = entriesToProcess.length;
 
-      try {
-        const url = new URL('https://nominatim.openstreetmap.org/reverse');
-        url.searchParams.set('format', 'jsonv2');
-        url.searchParams.set('lat', String(pair.lat));
-        url.searchParams.set('lon', String(pair.lon));
-        url.searchParams.set('accept-language', 'ar');
-        url.searchParams.set('addressdetails', '1');
+    const pendingAfterGoogle: [string, { lat: number; lon: number }][] = [];
+    let googleQuotaBlocked = false;
 
-        const geoResp = await fetch(url.toString(), {
-          headers: { 'User-Agent': 'sekem_farm_mapper/1.0' },
-        });
-        if (geoResp.ok) {
-          const geoJson = (await geoResp.json()) as { address?: Record<string, string> };
-          const addr = geoJson.address || {};
-          const entry: MarkazEntry = {
-            governorate: addr.state || 'غير محدد',
-            markaz: addr.county || addr.city_district || addr.town || 'غير محدد',
-            village: addr.village || addr.suburb || 'غير محدد',
-          };
-          cache[key] = entry;
-          resolved[key] = entry;
-          newLookups += 1;
+    if (useGoogle && entriesToProcess.length > 0) {
+      const concurrency = 12;
+      for (let i = 0; i < entriesToProcess.length; i += concurrency) {
+        if (googleQuotaBlocked) {
+          pendingAfterGoogle.push(...entriesToProcess.slice(i));
+          break;
         }
-      } catch {
-        // Leave unresolved on transient network error
+        const slice = entriesToProcess.slice(i, i + concurrency);
+        const results = await Promise.all(
+          slice.map(async ([key, pair]) => ({
+            key,
+            pair,
+            res: await reverseGeocodeGoogle(pair.lat, pair.lon, googleApiKey),
+          })),
+        );
+
+        for (const item of results) {
+          if (item.res.quotaBlocked) {
+            googleQuotaBlocked = true;
+            googleQuotaBlockedUntil = Date.now() + 10 * 60 * 1000;
+          }
+          if (item.res.entry && !item.res.incomplete) {
+            const normalizedEntry: MarkazEntry = {
+              ...item.res.entry,
+              governorate:
+                item.res.entry.isEgypt === false
+                  ? item.res.entry.governorate
+                  : normalizeEgyptGovernorateName(item.res.entry.governorate),
+            };
+            cache[item.key] = normalizedEntry;
+            resolved[item.key] = normalizedEntry;
+            newLookups += 1;
+          } else {
+            pendingAfterGoogle.push([item.key, item.pair]);
+          }
+        }
+      }
+    } else {
+      pendingAfterGoogle.push(...entriesToProcess);
+    }
+
+    // Primary high-speed Arabic fallback: ArcGIS World Geocoding (Locality + default, 16 concurrent)
+    const fallbackToNominatim: [string, { lat: number; lon: number }][] = [];
+    if (pendingAfterGoogle.length > 0) {
+      const arcConcurrency = 16;
+      for (let i = 0; i < pendingAfterGoogle.length; i += arcConcurrency) {
+        const slice = pendingAfterGoogle.slice(i, i + arcConcurrency);
+        const results = await Promise.all(
+          slice.map(async ([key, pair]) => ({
+            key,
+            pair,
+            entry: await reverseGeocodeArcGis(pair.lat, pair.lon),
+          })),
+        );
+
+        for (const item of results) {
+          if (item.entry) {
+            cache[item.key] = item.entry;
+            resolved[item.key] = item.entry;
+            newLookups += 1;
+          } else {
+            fallbackToNominatim.push([item.key, item.pair]);
+          }
+        }
+      }
+    }
+
+    // Last-resort Nominatim check (capped at 5 items per batch to prevent timeouts)
+    const nominatimSlice = fallbackToNominatim.slice(0, 5);
+    for (let idx = 0; idx < nominatimSlice.length; idx++) {
+      const [key, pair] = nominatimSlice[idx];
+      if (idx > 0) {
+        await delay(1050);
+      }
+      const entry = await reverseGeocodeNominatim(pair.lat, pair.lon);
+      if (entry) {
+        cache[key] = entry;
+        resolved[key] = entry;
+        newLookups += 1;
       }
     }
 
@@ -602,6 +1318,11 @@ async function startServer(): Promise<void> {
       newLookups,
       remainingUncached: Math.max(0, uniquePairs.size - processed),
     });
+  });
+
+  app.get('/api/maps-config', (_req: Request, res: Response) => {
+    const apiKey = process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || '';
+    res.json({ apiKey });
   });
 
   const isProd = process.env.NODE_ENV === 'production';
