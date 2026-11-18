@@ -1,15 +1,76 @@
 {
-  "name": "react-example",
+  "name": "sekem-farms-mapper",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "Sekem Farms Spatial Mapper & ERPNext Analytics Desktop Application",
+  "author": "Sekem Engineering",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
     "build": "vite build",
+    "build:server": "esbuild server.ts --bundle --platform=node --packages=external --format=cjs --outfile=dist-server/server.cjs",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "clean": "rm -rf dist dist-server release server.js",
+    "lint": "tsc --noEmit",
+    "electron:dev": "concurrently -k -n VITE,API,ELECTRON -c cyan,green,yellow \"cross-env BACKEND_PORT=3001 vite --port 5173\" \"cross-env PORT=3001 BIND_HOST=127.0.0.1 ELECTRON_API_ONLY=true tsx server.ts\" \"wait-on http-get://127.0.0.1:3001/api/health http-get://127.0.0.1:5173 && cross-env ELECTRON_DEV=true BACKEND_PORT=3001 VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "electron:build": "npm run build && npm run build:server && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.sekem.farmsmapper",
+    "productName": "Sekem Farms Mapper",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-server/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "farm_markaz_aggregator.py",
+        "to": "farm_markaz_aggregator.py"
+      },
+      {
+        "from": "geocode_cache.json",
+        "to": "geocode_cache.json"
+      },
+      {
+        "from": ".env.example",
+        "to": ".env.example"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Sekem Farms Mapper",
+      "artifactName": "${productName}-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    }
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -30,14 +91,19 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
+    "concurrently": "^10.0.7",
+    "cross-env": "^10.1.0",
+    "electron": "^45.3.4",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "wait-on": "^9.5.1"
   }
 }

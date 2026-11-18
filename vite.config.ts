@@ -5,7 +5,10 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const backendPort = process.env.BACKEND_PORT || '3001';
+
   return {
+    base: './',
     plugins: [
       react(),
       tailwindcss(),
@@ -39,6 +42,12 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      proxy: {
+        '/api': {
+          target: `http://127.0.0.1:${backendPort}`,
+          changeOrigin: true,
+        },
+      },
     },
   };
 });

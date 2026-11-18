@@ -1,14 +1,71 @@
-import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import dotenv from 'dotenv';
 import express from 'express';
 import type { Request, Response } from 'express';
 
-const PORT = 3000;
+const USER_DATA_DIR = process.env.USER_DATA_DIR || '';
+const RESOURCES_PATH = process.env.RESOURCES_PATH || process.cwd();
+
+const envCandidates = [
+  process.env.ENV_FILE_PATH,
+  USER_DATA_DIR ? path.join(USER_DATA_DIR, '.env') : undefined,
+  RESOURCES_PATH ? path.join(RESOURCES_PATH, '.env') : undefined,
+  path.resolve(process.cwd(), '.env'),
+].filter((p): p is string => Boolean(p));
+
+const loadedEnvPaths: string[] = [];
+for (const envPath of envCandidates) {
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath });
+    loadedEnvPaths.push(envPath);
+  }
+}
+
+const PORT = Number(process.env.PORT) || 3000;
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
 const ERPNEXT_URL = (process.env.ERPNEXT_URL || 'https://erp-sys.sekem.com').replace(/\/+$/, '');
-const CACHE_FILE = path.resolve(process.cwd(), 'geocode_cache.json');
-const DIST_DIR = path.resolve(process.cwd(), 'dist');
+
+const SEED_CACHE_CANDIDATES = [
+  path.join(RESOURCES_PATH, 'geocode_cache.json'),
+  path.resolve(process.cwd(), 'geocode_cache.json'),
+];
+const CACHE_FILE = USER_DATA_DIR
+  ? path.join(USER_DATA_DIR, 'geocode_cache.json')
+  : path.resolve(process.cwd(), 'geocode_cache.json');
+
+const PYTHON_SCRIPT_PATH = fs.existsSync(path.join(RESOURCES_PATH, 'farm_markaz_aggregator.py'))
+  ? path.join(RESOURCES_PATH, 'farm_markaz_aggregator.py')
+  : path.resolve(process.cwd(), 'farm_markaz_aggregator.py');
+
+const DIST_DIR_CANDIDATES = [
+  process.env.STATIC_DIST_DIR,
+  path.resolve(process.cwd(), 'dist'),
+  process.argv[1] ? path.resolve(path.dirname(process.argv[1]), '../dist') : undefined,
+].filter((p): p is string => Boolean(p));
+const DIST_DIR =
+  DIST_DIR_CANDIDATES.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) ||
+  path.resolve(process.cwd(), 'dist');
+
+function ensureWritableCacheFile(): void {
+  try {
+    const dir = path.dirname(CACHE_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    if (!fs.existsSync(CACHE_FILE)) {
+      const seed = SEED_CACHE_CANDIDATES.find(
+        (candidate) => candidate !== CACHE_FILE && fs.existsSync(candidate),
+      );
+      if (seed) {
+        fs.copyFileSync(seed, CACHE_FILE);
+      }
+    }
+  } catch {
+    // Non-fatal: cache continues in memory if userData dir is unavailable
+  }
+}
 
 interface ErpSession {
   sid: string;
@@ -181,6 +238,10 @@ function writeGeocodeCache(cache: Record<string, MarkazEntry>): void {
       isEgypt: v.isEgypt !== false,
       ...(v.countryCode ? { countryCode: v.countryCode } : {}),
     };
+  }
+  const dir = path.dirname(CACHE_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(CACHE_FILE, JSON.stringify(serializable, null, 2), 'utf-8');
 }
@@ -692,8 +753,21 @@ function detectLatLonFromRecord(record: Record<string, unknown>): {
 }
 
 async function startServer(): Promise<void> {
+  ensureWritableCacheFile();
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  app.get('/api/health', (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      status: 'ready',
+      port: PORT,
+      pythonScriptPath: PYTHON_SCRIPT_PATH,
+      pythonScriptAvailable: fs.existsSync(PYTHON_SCRIPT_PATH),
+      cacheFile: CACHE_FILE,
+      envLoadedFrom: loadedEnvPaths,
+    });
+  });
 
   app.get('/api/erp/session', async (req: Request, res: Response) => {
     const found = getSessionFromRequest(req);
@@ -1326,22 +1400,27 @@ async function startServer(): Promise<void> {
   });
 
   const isProd = process.env.NODE_ENV === 'production';
-  if (!isProd) {
+  const apiOnly = process.env.ELECTRON_API_ONLY === 'true';
+  if (!isProd && !apiOnly) {
     const { createServer } = await import('vite');
     const vite = await createServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else if (fs.existsSync(DIST_DIR)) {
+  } else if (isProd && fs.existsSync(DIST_DIR)) {
     app.use(express.static(DIST_DIR));
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api/')) {
+        res.status(404).json({ error: 'API route not found' });
+        return;
+      }
       res.sendFile(path.join(DIST_DIR, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, BIND_HOST, () => {
+    console.log(`Server listening on http://${BIND_HOST}:${PORT}`);
   });
 }
 
