@@ -1,0 +1,6 @@
+{
+  "name": "FieldMark Operations Dashboard",
+  "description": "A clean Tailwind CSS dashboard structure with a structured header and main content workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
